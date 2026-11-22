@@ -56,6 +56,7 @@
       <button class="tab" data-t="errors">Problems</button>
     </div>
     <div id="companies"></div>
+    <div id="usersView" style="display:none"></div>
     <div id="live" style="display:none"></div>
     <div id="errors" style="display:none"></div>
   </div>
@@ -157,6 +158,52 @@ async function setAdminPin(c) {
   catch (e) { alert('Could not save: ' + (e.code || e.message)); }
 }
 
+const FIXED = [['admin', 'Admin'], ['head', 'Head'], ['cashier1', 'Cashier 1'], ['cashier2', 'Cashier 2']];
+async function workersOf(c) {
+  const path = c.id === LEGACY ? ['settings', 'workers'] : ['companies', c.id, 'settings', 'workers'];
+  try { const s = await getDoc(doc(db, ...path)); return s.exists() ? (s.data().list || []) : []; } catch (e) { return []; }
+}
+async function allPins() {
+  const all = [];
+  for (const x of companies) { const p = await pinsOf(x); Object.keys(p).forEach(u => all.push({ cid: x.id, cname: x.name, u, pin: String(p[u]) })); }
+  return all;
+}
+async function setUserPin(c, u, label) {
+  const pin = (prompt('New PIN for ' + label + ' at ' + c.name + ' (4 to 6 digits, unique across all companies):', '') || '').trim();
+  if (!pin) return;
+  if (!/^\d{4,6}$/.test(pin)) return alert('PIN must be 4 to 6 digits.');
+  const all = await allPins();
+  const clash = all.find(x => x.pin === pin && !(x.cid === c.id && x.u === u));
+  if (clash) return alert('That PIN is already used by ' + clash.u + ' at ' + clash.cname + '. Choose another.');
+  try { await setDoc(doc(db, ...(c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'])), { [u]: pin }, { merge: true }); } catch (e) { return alert('Could not save: ' + (e.code || e.message)); }
+  openUsers(c);
+}
+async function openUsers(c) {
+  const v = $('usersView'); v.style.display = 'block'; $('companies').style.display = 'none'; v.innerHTML = '';
+  v.appendChild(el('div', 'padding:10px', 'Loading…'));
+  const pins = await pinsOf(c), workers = await workersOf(c), all = await allPins();
+  v.innerHTML = '';
+  const top = el('div'); top.className = 'row'; top.style.marginBottom = '12px';
+  const back = el('button', '', '← Back'); back.className = 'act'; back.onclick = () => { v.style.display = 'none'; $('companies').style.display = 'block'; };
+  top.appendChild(back); top.appendChild(el('b', '', c.name + ' · Users & PINs')); v.appendChild(top);
+  const rows = FIXED.slice(); const seen = new Set(FIXED.map(x => x[0]));
+  workers.concat(Object.keys(pins)).forEach(u => { if (!seen.has(u)) { seen.add(u); rows.push([u, u]); } });
+  rows.forEach(([u, label]) => {
+    const pin = pins[u] !== undefined ? String(pins[u]) : null;
+    const dup = pin && all.filter(x => x.pin === pin).length > 1;
+    const card = el('div'); card.className = 'card';
+    const r = el('div'); r.className = 'row';
+    const l = el('div'); l.appendChild(el('div', 'font-weight:600', label));
+    const role = workers.includes(u) ? 'Worker' : FIXED.some(x => x[0] === u) ? 'Role' : 'Other'; const d = el('div', '', role + (dup ? ' · ⚠️ PIN used twice' : '')); d.className = 'dim'; if (dup) d.style.color = 'var(--amber)'; l.appendChild(d);
+    const right = el('div', 'display:flex;align-items:center;gap:8px');
+    const shown = el('span', 'font-family:monospace;font-size:16px;min-width:64px;text-align:right', pin ? '••••' : 'not set');
+    if (pin) { shown.style.cursor = 'pointer'; let on = false; shown.onclick = () => { on = !on; shown.textContent = on ? pin : '••••'; }; }
+    const ed = el('button', '', '✏️'); ed.className = 'act'; ed.onclick = () => setUserPin(c, u, label);
+    right.appendChild(shown); right.appendChild(ed); r.appendChild(l); r.appendChild(right); card.appendChild(r); v.appendChild(card);
+  });
+  const hint = el('div', 'margin-top:8px', 'Tap a PIN to show it. Workers appear here after the company admin adds them in the app.'); hint.className = 'dim'; v.appendChild(hint);
+}
+
 async function saveCompany(editId) {
   const cur = editId ? companies.find(x => x.id === editId) : null;
   const name = (prompt('Company name:', cur ? cur.name : '') || '').trim(); if (!name) return;
@@ -205,7 +252,7 @@ function render() {
     const btns = el('div', 'display:flex;gap:8px;margin-top:12px');
     const b = el('button', 'flex:1;' + (sus ? '' : 'color:var(--red)'), sus ? '▶ Resume' : '⏸ Suspend'); b.className = 'act'; b.onclick = () => toggleSuspend(c);
     const rn = el('button', 'flex:1', '✏️ Rename'); rn.className = 'act'; rn.onclick = () => saveCompany(c.id);
-    const pn = el('button', 'flex:1', '🔑 PIN'); pn.className = 'act'; pn.onclick = () => setAdminPin(c);
+    const pn = el('button', 'flex:1', '👥 Users'); pn.className = 'act'; pn.onclick = () => openUsers(c);
     btns.appendChild(b); btns.appendChild(rn); btns.appendChild(pn); card.appendChild(btns); box.appendChild(card);
   });
   // Live
