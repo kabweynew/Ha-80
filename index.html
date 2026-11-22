@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Owner Console</title>
+<meta name="theme-color" content="#0f172a">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Owner">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --text:#f1f5f9; --dim:#94a3b8; --green:#22c55e; --red:#ef4444; --amber:#f59e0b; --blue:#3b82f6; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0); }
+  .wrap { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:8px 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .dim { color:var(--dim); font-size:12px; }
+  .tabs { display:flex; gap:8px; margin-bottom:12px; }
+  .tab { flex:1; padding:10px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--text); font-size:14px; }
+  .tab.on { background:var(--blue); border-color:var(--blue); }
+  input { width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--text); font-size:16px; }
+  button.act { padding:8px 12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--text); font-size:13px; }
+  button.go { width:100%; margin-top:10px; padding:12px; border-radius:10px; border:0; background:var(--blue); color:#fff; font-size:16px; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:10px; text-align:center; }
+  .stats b { display:block; font-size:18px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+  .err { border-left:3px solid var(--red); }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; }
+  #msg { color:var(--red); font-size:13px; margin-top:8px; min-height:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="lock">
+    <h1>🛡️ Owner Console</h1>
+    <div class="card">
+      <div class="dim" id="hint" style="margin-bottom:8px">Enter your private setup code</div>
+      <input id="code" type="password" autocomplete="off" placeholder="Setup code">
+      <input id="code2" type="password" autocomplete="off" placeholder="Repeat setup code" style="display:none;margin-top:8px">
+      <button class="go" id="enter">Open</button>
+      <div id="msg"></div>
+    </div>
+  </div>
+  <div id="main" style="display:none">
+    <div class="row"><h1>🛡️ Owner Console</h1><button class="act" id="refresh">↻ Refresh</button></div>
+    <div class="tabs">
+      <button class="tab on" data-t="companies">Companies</button>
+      <button class="tab" data-t="live">Live</button>
+      <button class="tab" data-t="errors">Problems</button>
+    </div>
+    <div id="companies"></div>
+    <div id="live" style="display:none"></div>
+    <div id="errors" style="display:none"></div>
+  </div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, doc, getDoc, setDoc, getDocs, onSnapshot, query, orderBy, limit, getCountFromServer } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const app = initializeApp({
+  apiKey: "AIzaSyDlMIQekGsMTZlPqNWddeL2tqPwNCknetg",
+  authDomain: "haaa-3b06e.firebaseapp.com",
+  projectId: "haaa-3b06e",
+  storageBucket: "haaa-3b06e.firebasestorage.app",
+  messagingSenderId: "172639268578",
+  appId: "1:172639268578:web:ab7b25bab6bca71e33b8bb"
+});
+const db = getFirestore(app);
+const $ = id => document.getElementById(id);
+const LEGACY = 'haaa';
+const ONLINE_MS = 150000; // a session is "online" if it reported in the last 2.5 minutes
+
+let companies = [{ id: LEGACY, name: 'WKABE', sub: 'Hask Services — Djibouti' }];
+let status = {}, presence = [], errors = [], counts = {};
+
+const sha256 = async t => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)))).map(x => x.toString(16).padStart(2, '0')).join('');
+const el = (tag, css, text) => { const e = document.createElement(tag); if (css) e.style.cssText = css; if (text !== undefined) e.textContent = text; return e; };
+const path = (id, name) => id === LEGACY ? [name] : ['companies', id, name];
+const ago = ts => { const s = Math.max(0, Math.round((Date.now() - ts) / 1000)); return s < 60 ? s + 's ago' : s < 3600 ? Math.round(s / 60) + ' min ago' : s < 86400 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago'; };
+const isOn = p => p.online && Date.now() - p.lastSeen < ONLINE_MS;
+
+let firstTime = false;
+(async () => { try { firstTime = !(await getDoc(doc(db, 'appConfig', 'setup'))).exists();
+  if (firstTime) { $('code2').style.display = 'block'; $('enter').textContent = 'Create code & open'; $('hint').textContent = 'First time: create your private setup code (at least 8 characters, keep it secret).'; } } catch (e) {} })();
+
+$('enter').onclick = async () => {
+  const msg = t => $('msg').textContent = t;
+  try {
+    const sref = doc(db, 'appConfig', 'setup');
+    const code = $('code').value.trim();
+    if (firstTime) {
+      if (code.length < 8) return msg('Use at least 8 characters');
+      if (code !== $('code2').value.trim()) return msg('Codes do not match');
+      const salt = crypto.randomUUID(); await setDoc(sref, { salt, hash: await sha256(salt + code) });
+    } else {
+      const s = await getDoc(sref); const d = s.data();
+      if (await sha256(d.salt + code) !== d.hash) return msg('Wrong code');
+    }
+    $('lock').style.display = 'none'; $('main').style.display = 'block';
+    start();
+  } catch (e) { msg('Error: ' + (e.code || e.message)); }
+};
+$('code').addEventListener('keydown', e => { if (e.key === 'Enter') $('enter').click(); });
+
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === b));
+  ['companies', 'live', 'errors'].forEach(t => $(t).style.display = t === b.dataset.t ? 'block' : 'none');
+});
+$('refresh').onclick = () => loadCounts();
+
+async function start() {
+  try {
+    const c = await getDoc(doc(db, 'appConfig', 'companies'));
+    const extra = c.exists() ? (c.data().list || []) : [];
+    const m = {}; companies.concat(extra).forEach(x => m[x.id] = x); companies = Object.values(m);
+  } catch (e) {}
+  onSnapshot(doc(db, 'appConfig', 'companyStatus'), s => { status = s.exists() ? s.data() : {}; render(); });
+  onSnapshot(collection(db, 'presence'), s => { presence = s.docs.map(d => d.data()); render(); });
+  onSnapshot(query(collection(db, 'errorLogs'), orderBy('ts', 'desc'), limit(60)), s => { errors = s.docs.map(d => d.data()); render(); });
+  loadCounts();
+  setInterval(render, 30000);
+  setInterval(loadCounts, 120000);
+}
+
+async function loadCounts() {
+  for (const c of companies) {
+    counts[c.id] = counts[c.id] || {};
+    try { counts[c.id].trucks = (await getCountFromServer(collection(db, ...path(c.id, 'trucks')))).data().count; } catch (e) { counts[c.id].trucks = '?'; }
+    try { const w = await getDoc(doc(db, ...path(c.id, 'settings'), 'workers')); counts[c.id].workers = w.exists() ? (w.data().list || []).length : 0; } catch (e) { counts[c.id].workers = '?'; }
+  }
+  render();
+}
+
+const LEGACY_DEFAULT_PINS = { admin:'2055', head:'2013', cashier1:'7777', cashier2:'8888', Ahmed:'1111', Ali:'2222', Oli:'3333', Omar:'4444', Radwan:'5555' };
+async function pinsOf(c) {
+  const path = c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'];
+  let d = {}; try { const s = await getDoc(doc(db, ...path)); d = s.exists() ? s.data() : {}; } catch (e) {}
+  return c.id === LEGACY ? Object.assign({}, LEGACY_DEFAULT_PINS, d) : d;
+}
+async function setAdminPin(c) {
+  const pin = (prompt('Admin PIN for ' + c.name + ' (4 to 6 digits, must be different from every other PIN):', '') || '').trim();
+  if (!pin) return;
+  if (!/^\d{4,6}$/.test(pin)) return alert('PIN must be 4 to 6 digits.');
+  for (const x of companies) {
+    const pins = await pinsOf(x);
+    for (const u of Object.keys(pins)) if (String(pins[u]) === pin && !(x.id === c.id && u === 'admin')) return alert('That PIN is already used by someone in ' + x.name + '. Choose another.');
+  }
+  try { await setDoc(doc(db, ...(c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'])), { admin: pin }, { merge: true }); alert('Admin PIN saved for ' + c.name + '.'); }
+  catch (e) { alert('Could not save: ' + (e.code || e.message)); }
+}
+
+async function saveCompany(editId) {
+  const cur = editId ? companies.find(x => x.id === editId) : null;
+  const name = (prompt('Company name:', cur ? cur.name : '') || '').trim(); if (!name) return;
+  const sub = (prompt('Subtitle (optional):', cur ? (cur.sub || '') : '') || '').trim();
+  try {
+    const cref = doc(db, 'appConfig', 'companies'); const cs = await getDoc(cref);
+    const list = cs.exists() ? (cs.data().list || []) : [];
+    let id = editId;
+    if (id) { const i = list.findIndex(c => c.id === id); const item = { id, name, sub }; if (i >= 0) list[i] = item; else list.push(item); }
+    else { id = (name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'co') + Math.random().toString(36).slice(2, 6); list.push({ id, name, sub }); }
+    await setDoc(cref, { list });
+    const m = {}; companies.concat(list).forEach(x => m[x.id] = x); companies = Object.values(m);
+    loadCounts();
+    if (!editId) await setAdminPin({ id, name, sub });
+  } catch (e) { alert('Could not save: ' + (e.code || e.message)); }
+}
+
+async function toggleSuspend(c) {
+  const now = !!(status[c.id] && status[c.id].suspended);
+  let message = '';
+  if (!now) { message = prompt('Message workers will see (optional):', '') || ''; if (!confirm('Suspend ' + c.name + '? Everyone in this company will be locked out.')) return; }
+  else if (!confirm('Resume ' + c.name + '?')) return;
+  try { await setDoc(doc(db, 'appConfig', 'companyStatus'), { [c.id]: { suspended: !now, message, at: Date.now() } }, { merge: true }); } catch (e) { alert('Failed: ' + (e.code || e.message)); }
+}
+
+function render() {
+  const day = Date.now() - 86400000;
+  // Companies
+  const box = $('companies'); box.innerHTML = '';
+  const addB = el('button', 'width:100%;margin-bottom:12px;padding:12px', '＋ Add company'); addB.className = 'act'; addB.onclick = () => saveCompany(null); box.appendChild(addB);
+  companies.forEach(c => {
+    const sus = !!(status[c.id] && status[c.id].suspended);
+    const on = presence.filter(p => p.company === c.id && isOn(p)).length;
+    const errs = errors.filter(e => e.company === c.id && e.ts > day).length;
+    const k = counts[c.id] || {};
+    const card = el('div'); card.className = 'card';
+    const top = el('div'); top.className = 'row';
+    const left = el('div'); left.appendChild(el('div', 'font-weight:700;font-size:16px', c.name)); const sub = el('div', '', c.sub || c.id); sub.className = 'dim'; left.appendChild(sub);
+    const bd = el('span', 'background:' + (sus ? 'var(--red)' : 'var(--green)') + ';color:#fff', sus ? 'SUSPENDED' : 'ACTIVE'); bd.className = 'badge';
+    top.appendChild(left); top.appendChild(bd); card.appendChild(top);
+    const st = el('div'); st.className = 'stats';
+    [['Online', on], ['Trucks', k.trucks ?? '…'], ['Workers', k.workers ?? '…'], ['Errors 24h', errs]].forEach(([l, v]) => {
+      const x = el('div'); x.appendChild(el('b', l === 'Errors 24h' && v > 0 ? 'color:var(--amber)' : '', String(v))); const d = el('span', '', l); d.className = 'dim'; x.appendChild(d); st.appendChild(x);
+    });
+    card.appendChild(st);
+    const btns = el('div', 'display:flex;gap:8px;margin-top:12px');
+    const b = el('button', 'flex:1;' + (sus ? '' : 'color:var(--red)'), sus ? '▶ Resume' : '⏸ Suspend'); b.className = 'act'; b.onclick = () => toggleSuspend(c);
+    const rn = el('button', 'flex:1', '✏️ Rename'); rn.className = 'act'; rn.onclick = () => saveCompany(c.id);
+    const pn = el('button', 'flex:1', '🔑 PIN'); pn.className = 'act'; pn.onclick = () => setAdminPin(c);
+    btns.appendChild(b); btns.appendChild(rn); btns.appendChild(pn); card.appendChild(btns); box.appendChild(card);
+  });
+  // Live
+  const lv = $('live'); lv.innerHTML = '';
+  const online = presence.filter(isOn).sort((a, b) => b.lastSeen - a.lastSeen);
+  const h = el('div', 'margin-bottom:8px', online.length + ' online now'); h.className = 'dim'; lv.appendChild(h);
+  online.forEach(p => {
+    const card = el('div'); card.className = 'card';
+    const r = el('div'); r.className = 'row';
+    const l = el('div'); const n = el('div', 'font-weight:600'); const dot = el('span'); dot.className = 'dot'; dot.style.background = 'var(--green)'; n.appendChild(dot); n.appendChild(document.createTextNode(p.user + ' · ' + p.role)); l.appendChild(n);
+    const d = el('div', '', (p.companyName || p.company) + ' · ' + (p.device || '')); d.className = 'dim'; l.appendChild(d);
+    const t = el('div', '', ago(p.lastSeen)); t.className = 'dim'; r.appendChild(l); r.appendChild(t); card.appendChild(r); lv.appendChild(card);
+  });
+  const recent = presence.filter(p => !isOn(p)).sort((a, b) => b.lastSeen - a.lastSeen).slice(0, 8);
+  if (recent.length) { const h2 = el('div', 'margin:14px 0 8px', 'Recently signed out'); h2.className = 'dim'; lv.appendChild(h2);
+    recent.forEach(p => { const d = el('div', 'padding:6px 0;border-bottom:1px solid var(--line)', (p.user || '?') + ' · ' + (p.companyName || p.company) + ' · ' + ago(p.lastSeen)); d.className = 'dim'; lv.appendChild(d); }); }
+  // Errors
+  const er = $('errors'); er.innerHTML = '';
+  if (!errors.length) { const d = el('div', '', 'No problems reported 🎉'); d.className = 'dim'; er.appendChild(d); }
+  errors.forEach(e => {
+    const card = el('div'); card.className = 'card err';
+    card.appendChild(el('div', 'font-size:14px;word-break:break-word', e.msg));
+    const d = el('div', 'margin-top:6px', (e.companyName || e.company) + ' · ' + e.user + ' · ' + e.src + ' · ' + ago(e.ts)); d.className = 'dim'; card.appendChild(d); er.appendChild(card);
+  });
+}
+</script>
+<script>
+  if ('serviceWorker' in navigator) { window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); }); }
+</script>
+</body>
+</html>
