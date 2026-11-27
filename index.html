@@ -6,6 +6,9 @@
 <title>Owner Console</title>
 <meta name="theme-color" content="#0f172a">
 <link rel="manifest" href="manifest.json">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -33,6 +36,10 @@
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
   .err { border-left:3px solid var(--red); }
   .badge { font-size:11px; padding:2px 8px; border-radius:99px; }
+  .coname { display:inline-block; font-family:'Playfair Display',Georgia,'Times New Roman',serif; font-weight:800; line-height:1.15; letter-spacing:.4px; word-break:break-word;
+            background:linear-gradient(90deg,#ffffff 0%,var(--co2,#60a5fa) 100%); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; color:transparent;
+            filter:drop-shadow(0 2px 8px rgba(0,0,0,.35)); }
+  .cosub { font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--dim); margin-top:4px; }
   #msg { color:var(--red); font-size:13px; margin-top:8px; min-height:16px; }
 </style>
 </head>
@@ -45,11 +52,12 @@
       <input id="code" type="password" autocomplete="off" placeholder="Setup code">
       <input id="code2" type="password" autocomplete="off" placeholder="Repeat setup code" style="display:none;margin-top:8px">
       <button class="go" id="enter">Open</button>
+      <button class="go" id="bio" style="display:none;background:#10b981">🔐 Unlock with fingerprint / face</button>
       <div id="msg"></div>
     </div>
   </div>
   <div id="main" style="display:none">
-    <div class="row"><h1>🛡️ Owner Console</h1><button class="act" id="refresh">↻ Refresh</button></div>
+    <div class="row"><h1>🛡️ Owner Console</h1><div style="display:flex;gap:6px"><button class="act" id="bioSet" title="Fingerprint / face unlock on this device">🔐 Off</button><button class="act" id="refresh">↻ Refresh</button></div></div>
     <div class="tabs">
       <button class="tab on" data-t="companies">Companies</button>
       <button class="tab" data-t="live">Live</button>
@@ -57,6 +65,7 @@
     </div>
     <div id="companies"></div>
     <div id="usersView" style="display:none"></div>
+    <div id="designView" style="display:none"></div>
     <div id="live" style="display:none"></div>
     <div id="errors" style="display:none"></div>
   </div>
@@ -64,7 +73,7 @@
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, doc, getDoc, setDoc, getDocs, onSnapshot, query, orderBy, limit, getCountFromServer } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, doc, getDoc, setDoc, getDocs, onSnapshot, query, orderBy, limit, getCountFromServer, deleteField, updateDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 const app = initializeApp({
   apiKey: "AIzaSyDlMIQekGsMTZlPqNWddeL2tqPwNCknetg",
@@ -80,7 +89,7 @@ const LEGACY = 'haaa';
 const ONLINE_MS = 150000; // a session is "online" if it reported in the last 2.5 minutes
 
 let companies = [{ id: LEGACY, name: 'WKABE', sub: 'Hask Services — Djibouti' }];
-let status = {}, presence = [], errors = [], counts = {};
+let status = {}, presence = [], errors = [], counts = {}, themes = {};
 
 const sha256 = async t => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)))).map(x => x.toString(16).padStart(2, '0')).join('');
 const el = (tag, css, text) => { const e = document.createElement(tag); if (css) e.style.cssText = css; if (text !== undefined) e.textContent = text; return e; };
@@ -90,7 +99,10 @@ const isOn = p => p.online && Date.now() - p.lastSeen < ONLINE_MS;
 
 let firstTime = false;
 (async () => { try { firstTime = !(await getDoc(doc(db, 'appConfig', 'setup'))).exists();
-  if (firstTime) { $('code2').style.display = 'block'; $('enter').textContent = 'Create code & open'; $('hint').textContent = 'First time: create your private setup code (at least 8 characters, keep it secret).'; } } catch (e) {} })();
+  if (firstTime) { $('code2').style.display = 'block'; $('enter').textContent = 'Create code & open'; $('hint').textContent = 'First time: create your private setup code (at least 8 characters, keep it secret).'; } } catch (e) {}
+  refreshBioUI();
+  if (!firstTime && bioSupported() && getBio()) setTimeout(async () => { if (await bioUnlock()) openConsole(); }, 400);
+})();
 
 $('enter').onclick = async () => {
   const msg = t => $('msg').textContent = t;
@@ -105,9 +117,54 @@ $('enter').onclick = async () => {
       const s = await getDoc(sref); const d = s.data();
       if (await sha256(d.salt + code) !== d.hash) return msg('Wrong code');
     }
-    $('lock').style.display = 'none'; $('main').style.display = 'block';
-    start();
+    openConsole();
   } catch (e) { msg('Error: ' + (e.code || e.message)); }
+};
+
+// ── Fingerprint / face unlock (WebAuthn platform authenticator, this device only) ──
+const BIO_KEY = 'ownerBioCred';
+const getBio = () => { try { return localStorage.getItem(BIO_KEY); } catch (e) { return null; } };
+const setBio = v => { try { v ? localStorage.setItem(BIO_KEY, v) : localStorage.removeItem(BIO_KEY); } catch (e) {} };
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = t => Uint8Array.from(atob(t), c => c.charCodeAt(0));
+const bioSupported = () => !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext);
+function refreshBioUI() {
+  $('bio').style.display = (!firstTime && bioSupported() && getBio()) ? 'block' : 'none';
+  $('bioSet').textContent = getBio() ? '🔐 On' : '🔐 Off';
+}
+async function bioEnable() {
+  try {
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: 'Owner Console', id: location.hostname },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: 'owner', displayName: 'Owner' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
+      timeout: 60000 } });
+    setBio(b64(cred.rawId)); return true;
+  } catch (e) { alert('Fingerprint / face setup failed: ' + (e.name || e.message)); return false; }
+}
+async function bioUnlock() {
+  try {
+    const r = await navigator.credentials.get({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname,
+      allowCredentials: [{ id: unb64(getBio()), type: 'public-key', transports: ['internal'] }],
+      userVerification: 'required', timeout: 60000 } });
+    return !!r;
+  } catch (e) { return false; }
+}
+let started = false;
+function openConsole() {
+  $('lock').style.display = 'none'; $('main').style.display = 'block';
+  if (!started) { started = true; start(); }
+  refreshBioUI();
+}
+$('bio').onclick = async () => { if (await bioUnlock()) openConsole(); else $('msg').textContent = 'Fingerprint / face check failed. Use your setup code.'; };
+$('bioSet').onclick = async () => {
+  if (!bioSupported()) return alert('This browser or device does not support fingerprint / face unlock (it needs HTTPS and a screen lock).');
+  if (getBio()) { if (confirm('Turn off fingerprint / face unlock on this device?')) setBio(null); }
+  else if (await bioEnable()) alert('Fingerprint / face unlock is ON for this device. Next time, tap the green button to open the console. Your setup code still works too.');
+  refreshBioUI();
 };
 $('code').addEventListener('keydown', e => { if (e.key === 'Enter') $('enter').click(); });
 
@@ -124,6 +181,7 @@ async function start() {
     const m = {}; companies.concat(extra).forEach(x => m[x.id] = x); companies = Object.values(m);
   } catch (e) {}
   onSnapshot(doc(db, 'appConfig', 'companyStatus'), s => { status = s.exists() ? s.data() : {}; render(); });
+  onSnapshot(doc(db, 'appConfig', 'companyThemes'), s => { themes = s.exists() ? s.data() : {}; render(); });
   onSnapshot(collection(db, 'presence'), s => { presence = s.docs.map(d => d.data()); render(); });
   onSnapshot(query(collection(db, 'errorLogs'), orderBy('ts', 'desc'), limit(60)), s => { errors = s.docs.map(d => d.data()); render(); });
   loadCounts();
@@ -136,26 +194,111 @@ async function loadCounts() {
     counts[c.id] = counts[c.id] || {};
     try { counts[c.id].trucks = (await getCountFromServer(collection(db, ...path(c.id, 'trucks')))).data().count; } catch (e) { counts[c.id].trucks = '?'; }
     try { const w = await getDoc(doc(db, ...path(c.id, 'settings'), 'workers')); counts[c.id].workers = w.exists() ? (w.data().list || []).length : 0; } catch (e) { counts[c.id].workers = '?'; }
+    try { counts[c.id].haskSet = c.id === LEGACY ? true : !!((await rawPins(c)).admin); } catch (e) { counts[c.id].haskSet = false; }
+    try { counts[c.id].agSet = !!(await agCfg(c)); } catch (e) { counts[c.id].agSet = false; }
+    if (counts[c.id].agSet) { try { counts[c.id].agTrucks = (await getCountFromServer(collection(db, ...path(c.id, 'kab_trucks')))).data().count; } catch (e) { counts[c.id].agTrucks = '?'; } }
   }
   render();
 }
 
-const LEGACY_DEFAULT_PINS = { admin:'2055', head:'2013', cashier1:'7777', cashier2:'8888', Ahmed:'1111', Ali:'2222', Oli:'3333', Omar:'4444', Radwan:'5555' };
-async function pinsOf(c) {
+const LEGACY_DEFAULT_PINS = { admin:'2055', head:'2013', cashier1:'7777', cashier2:'8888', Ahmed:'1111', Oli:'3333' };
+async function rawPins(c) {
   const path = c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'];
-  let d = {}; try { const s = await getDoc(doc(db, ...path)); d = s.exists() ? s.data() : {}; } catch (e) {}
-  return c.id === LEGACY ? Object.assign({}, LEGACY_DEFAULT_PINS, d) : d;
+  try { const s = await getDoc(doc(db, ...path)); return s.exists() ? s.data() : {}; } catch (e) { return {}; }
 }
-async function setAdminPin(c) {
-  const pin = (prompt('Admin PIN for ' + c.name + ' (4 to 6 digits, must be different from every other PIN):', '') || '').trim();
+async function pinsOf(c) {   // only people who really exist: roles + current workers
+  const d = await rawPins(c);
+  let w = await workersOf(c);
+  if (c.id === LEGACY && !w.length) w = ['Ahmed', 'Ilyas', 'Oli'];
+  const valid = new Set(FIXED.map(x => x[0]).concat(w));
+  const merged = c.id === LEGACY ? Object.assign({}, LEGACY_DEFAULT_PINS, d) : d;
+  const out = {}; Object.keys(merged).forEach(u => { if (valid.has(u)) out[u] = merged[u]; });
+  return out;
+}
+const AG_COLORS = ['#d97706', '#10b981', '#3b82f6', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316'];
+const agRef = c => doc(db, ...(c.id === LEGACY ? ['kab_config', 'main'] : ['companies', c.id, 'kab_config', 'main']));
+async function agCfg(c) { try { const s = await getDoc(agRef(c)); return s.exists() ? s.data() : null; } catch (e) { return null; } }
+function agItems(cfg) {
+  if (!cfg) return [];
+  const out = [{ key: 'admin', label: 'Admin', pin: cfg.apin || '' }, { key: 'foreman', label: (cfg.foreman && cfg.foreman.name) || 'Foreman', pin: (cfg.foreman && cfg.foreman.pin) || '' }];
+  (cfg.posts || []).forEach(p => out.push({ key: 'post:' + p.id, label: p.label, pin: p.pin || '' }));
+  return out;
+}
+async function allAgashPins() {
+  const all = [];
+  for (const x of companies) agItems(await agCfg(x)).forEach(i => { if (i.pin) all.push({ cid: x.id, cname: x.name, key: i.key, label: i.label, pin: String(i.pin) }); });
+  return all;
+}
+async function ensureAgashConfig(c, adminPin) {
+  const cfg = await agCfg(c);
+  if (cfg) return updateDoc(agRef(c), { apin: adminPin });
+  return setDoc(agRef(c), { apin: adminPin, addingSuspended: false, arrimeurs: [],
+    foreman: { pin: '', name: 'Foreman', perms: { viewTrucks: true, viewPosts: true, addTruck: false, editTruck: false, deleteTruck: false } },
+    posts: AG_COLORS.map((col, i) => ({ id: 'p' + (i + 1), label: 'Post ' + (i + 1), pin: '', color: col })) });
+}
+async function setAgashPin(c, key, label) {
+  const pin = (prompt('New Agash PIN for ' + label + ' at ' + c.name + ' (4 to 6 digits, unique across all companies):', '') || '').trim();
   if (!pin) return;
   if (!/^\d{4,6}$/.test(pin)) return alert('PIN must be 4 to 6 digits.');
+  const clash = (await allAgashPins()).find(x => x.pin === pin && !(x.cid === c.id && x.key === key));
+  if (clash) return alert('That PIN is already used by ' + clash.label + ' at ' + clash.cname + '. Choose another.');
+  try {
+    const cfg = await agCfg(c); if (!cfg) return alert('Agash is not set up for this company yet.');
+    if (key === 'admin') await updateDoc(agRef(c), { apin: pin });
+    else if (key === 'foreman') await updateDoc(agRef(c), { 'foreman.pin': pin });
+    else { const posts = (cfg.posts || []).map(p => ('post:' + p.id === key) ? Object.assign({}, p, { pin }) : p); await updateDoc(agRef(c), { posts }); }
+  } catch (e) { return alert('Could not save: ' + (e.code || e.message)); }
+  openUsers(c);
+}
+async function askNewPin(text) {
+  const pin = (prompt(text, '') || '').trim();
+  if (!pin) return null;
+  if (!/^\d{4,6}$/.test(pin)) { alert('PIN must be 4 to 6 digits.'); return null; }
+  return pin;
+}
+async function setHaskAdminPin(c) {
+  const pin = await askNewPin('HASK app admin PIN for ' + c.name + ' (4 to 6 digits, must be different from every other Hask PIN):');
+  if (!pin) return;
   for (const x of companies) {
     const pins = await pinsOf(x);
-    for (const u of Object.keys(pins)) if (String(pins[u]) === pin && !(x.id === c.id && u === 'admin')) return alert('That PIN is already used by someone in ' + x.name + '. Choose another.');
+    for (const u of Object.keys(pins)) if (String(pins[u]) === pin && !(x.id === c.id && u === 'admin')) return alert('That PIN is already used by someone in ' + x.name + ' (Hask). Choose another.');
   }
-  try { await setDoc(doc(db, ...(c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'])), { admin: pin }, { merge: true }); alert('Admin PIN saved for ' + c.name + '.'); }
+  try { await setDoc(doc(db, ...(c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'])), { admin: pin }, { merge: true }); alert('Hask admin PIN saved for ' + c.name + '.'); }
   catch (e) { alert('Could not save: ' + (e.code || e.message)); }
+  loadCounts();
+}
+async function setAgashAdminPin(c) {
+  const pin = await askNewPin('AGASH app admin PIN for ' + c.name + ' (4 to 6 digits, must be different from every other Agash PIN):');
+  if (!pin) return;
+  const clash = (await allAgashPins()).find(x => x.pin === pin && !(x.cid === c.id && x.key === 'admin'));
+  if (clash) return alert('That PIN is already used in Agash by ' + clash.label + ' at ' + clash.cname + '. Choose another.');
+  try { await ensureAgashConfig(c, pin); alert('Agash admin PIN saved for ' + c.name + '.'); }
+  catch (e) { alert('Could not save: ' + (e.code || e.message)); }
+  loadCounts();
+}
+// random unique PIN for "reset"
+async function freshPin() {
+  const taken = new Set((await allPins()).map(x => x.pin)); (await allAgashPins()).forEach(x => taken.add(x.pin));
+  for (let i = 0; i < 500; i++) { const p = String(Math.floor(1000 + Math.random() * 9000)); if (!taken.has(p)) return p; }
+  return null;
+}
+async function resetUserPin(c, u, label) {
+  if (!confirm('Reset the PIN of ' + label + ' at ' + c.name + ' (Hask)? A new random PIN is created and the old one stops working.')) return;
+  const pin = await freshPin(); if (!pin) return alert('Could not find a free PIN.');
+  try { await setDoc(doc(db, ...(c.id === LEGACY ? ['settings', 'pins'] : ['companies', c.id, 'settings', 'pins'])), { [u]: pin }, { merge: true }); }
+  catch (e) { return alert('Could not save: ' + (e.code || e.message)); }
+  alert('New PIN for ' + label + ' (Hask): ' + pin); openUsers(c);
+}
+async function resetAgashPin(c, key, label) {
+  if (!confirm('Reset the PIN of ' + label + ' at ' + c.name + ' (Agash)? A new random PIN is created and the old one stops working.')) return;
+  const pin = await freshPin(); if (!pin) return alert('Could not find a free PIN.');
+  try {
+    const cfg = await agCfg(c); if (!cfg) return alert('Agash is not set up for this company yet.');
+    if (key === 'admin') await updateDoc(agRef(c), { apin: pin });
+    else if (key === 'foreman') await updateDoc(agRef(c), { 'foreman.pin': pin });
+    else { const posts = (cfg.posts || []).map(p => ('post:' + p.id === key) ? Object.assign({}, p, { pin }) : p); await updateDoc(agRef(c), { posts }); }
+  } catch (e) { return alert('Could not save: ' + (e.code || e.message)); }
+  alert('New PIN for ' + label + ' (Agash): ' + pin); openUsers(c);
 }
 
 const FIXED = [['admin', 'Admin'], ['head', 'Head'], ['cashier1', 'Cashier 1'], ['cashier2', 'Cashier 2']];
@@ -167,6 +310,11 @@ async function allPins() {
   const all = [];
   for (const x of companies) { const p = await pinsOf(x); Object.keys(p).forEach(u => all.push({ cid: x.id, cname: x.name, u, pin: String(p[u]) })); }
   return all;
+}
+async function purgeUser(c, u) {   // remove a person's PIN and permissions from Firestore for good
+  const base = c.id === LEGACY ? ['settings'] : ['companies', c.id, 'settings'];
+  await setDoc(doc(db, ...base, 'pins'), { [u]: deleteField() }, { merge: true });
+  try { await setDoc(doc(db, ...base, 'perms'), { [u]: deleteField() }, { merge: true }); } catch (e) {}
 }
 async function setUserPin(c, u, label) {
   const pin = (prompt('New PIN for ' + label + ' at ' + c.name + ' (4 to 6 digits, unique across all companies):', '') || '').trim();
@@ -187,7 +335,7 @@ async function openUsers(c) {
   const back = el('button', '', '← Back'); back.className = 'act'; back.onclick = () => { v.style.display = 'none'; $('companies').style.display = 'block'; };
   top.appendChild(back); top.appendChild(el('b', '', c.name + ' · Users & PINs')); v.appendChild(top);
   const rows = FIXED.slice(); const seen = new Set(FIXED.map(x => x[0]));
-  workers.concat(Object.keys(pins)).forEach(u => { if (!seen.has(u)) { seen.add(u); rows.push([u, u]); } });
+  workers.forEach(u => { if (!seen.has(u)) { seen.add(u); rows.push([u, u]); } });
   rows.forEach(([u, label]) => {
     const pin = pins[u] !== undefined ? String(pins[u]) : null;
     const dup = pin && all.filter(x => x.pin === pin).length > 1;
@@ -199,11 +347,154 @@ async function openUsers(c) {
     const shown = el('span', 'font-family:monospace;font-size:16px;min-width:64px;text-align:right', pin ? '••••' : 'not set');
     if (pin) { shown.style.cursor = 'pointer'; let on = false; shown.onclick = () => { on = !on; shown.textContent = on ? pin : '••••'; }; }
     const ed = el('button', '', '✏️'); ed.className = 'act'; ed.onclick = () => setUserPin(c, u, label);
-    right.appendChild(shown); right.appendChild(ed); r.appendChild(l); r.appendChild(right); card.appendChild(r); v.appendChild(card);
+    const rs = el('button', '', '🎲'); rs.className = 'act'; rs.title = 'Reset to a new random PIN'; rs.onclick = () => resetUserPin(c, u, label);
+    right.appendChild(shown); right.appendChild(ed); right.appendChild(rs); r.appendChild(l); r.appendChild(right); card.appendChild(r); v.appendChild(card);
   });
-  const hint = el('div', 'margin-top:8px', 'Tap a PIN to show it. Workers appear here after the company admin adds them in the app.'); hint.className = 'dim'; v.appendChild(hint);
+  const ag = agItems(await agCfg(c)), agAll = await allAgashPins();
+  const agH = el('div', 'margin:18px 0 8px;font-weight:700', 'Agash app (sealers)'); v.appendChild(agH);
+  if (!ag.length) { const n = el('div', '', 'Not set up yet. It is created when you set this company\'s admin PIN (use ＋ Set up Agash on the company card).'); n.className = 'dim'; v.appendChild(n); }
+  ag.forEach(i => {
+    const dup = i.pin && agAll.filter(x => x.pin === String(i.pin)).length > 1;
+    const card = el('div'); card.className = 'card'; const r = el('div'); r.className = 'row';
+    const l = el('div'); l.appendChild(el('div', 'font-weight:600', i.label)); const d = el('div', '', 'Agash' + (dup ? ' · ⚠️ PIN used twice' : '')); d.className = 'dim'; if (dup) d.style.color = 'var(--amber)'; l.appendChild(d);
+    const right = el('div', 'display:flex;align-items:center;gap:8px');
+    const shown = el('span', 'font-family:monospace;font-size:16px;min-width:64px;text-align:right', i.pin ? '••••' : 'not set');
+    if (i.pin) { shown.style.cursor = 'pointer'; let on = false; shown.onclick = () => { on = !on; shown.textContent = on ? String(i.pin) : '••••'; }; }
+    const ed = el('button', '', '✏️'); ed.className = 'act'; ed.onclick = () => setAgashPin(c, i.key, i.label);
+    const rs = el('button', '', '🎲'); rs.className = 'act'; rs.title = 'Reset to a new random PIN'; rs.onclick = () => resetAgashPin(c, i.key, i.label);
+    right.appendChild(shown); right.appendChild(ed); right.appendChild(rs); r.appendChild(l); r.appendChild(right); card.appendChild(r); v.appendChild(card);
+  });
+  const raw = await rawPins(c);
+  const stale = Object.keys(raw).filter(u => !seen.has(u));
+  if (stale.length) {
+    const h = el('div', 'margin:16px 0 8px', 'Old entries (people no longer in the app). They are ignored at login. Delete to clean up.'); h.className = 'dim'; v.appendChild(h);
+    const all = el('button', 'width:100%;margin-bottom:10px;padding:12px;color:var(--red)', '🗑 Delete ALL ' + stale.length + ' old entries'); all.className = 'act';
+    all.onclick = async () => { if (!confirm('Permanently delete all ' + stale.length + ' old entries (names, PINs and permissions)? Current workers and roles are NOT touched.')) return; try { for (const u of stale) await purgeUser(c, u); } catch (e) { return alert('Failed: ' + (e.code || e.message)); } openUsers(c); };
+    v.appendChild(all);
+    stale.forEach(u => {
+      const card = el('div'); card.className = 'card'; card.style.opacity = '.7';
+      const r = el('div'); r.className = 'row';
+      r.appendChild(el('div', 'font-weight:600', JSON.stringify(u).slice(1, -1) + '  (' + u.length + ' chars)'));
+      const del = el('button', '', '🗑 Delete'); del.className = 'act'; del.style.color = 'var(--red)';
+      del.onclick = async () => { if (!confirm('Permanently delete old entry "' + u + '"?')) return; try { await purgeUser(c, u); } catch (e) { return alert('Failed: ' + (e.code || e.message)); } openUsers(c); };
+      r.appendChild(del); card.appendChild(r); v.appendChild(card);
+    });
+  }
+  const hint = el('div', 'margin-top:8px', 'Tap a PIN to show it. ✏️ = type a new PIN, 🎲 = reset to a random PIN. Workers appear here after the company admin adds them in the app.'); hint.className = 'dim'; v.appendChild(hint);
 }
 
+
+// ── COMPANY LOOKS: colors + corners, previewed here and applied to the company's apps ──
+const hslHex = (h, s, l) => { s /= 100; l /= 100; const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1))); return '#' + [f(0), f(8), f(4)].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join(''); };
+const hexHsl = hex => { const r = parseInt(hex.slice(1, 3), 16) / 255, g = parseInt(hex.slice(3, 5), 16) / 255, b = parseInt(hex.slice(5, 7), 16) / 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b); let h = 0, s = 0; const l = (mx + mn) / 2; if (mx !== mn) { const d = mx - mn; s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn); h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h *= 60; } return [h, s * 100, l * 100]; };
+function lookVars(hue, sat, accent) {
+  const [ah, as, al] = hexHsl(accent);
+  return { bg: hslHex(hue, sat, 7), bg2: hslHex(hue, sat * .95, 10), card: hslHex(hue, sat * .9, 13), card2: hslHex(hue, sat * .85, 17), bg4: hslHex(hue, sat * .8, 21), border: hslHex(hue, sat * .7, 26), accent, accent2: hslHex(ah, as, Math.max(10, al - 8)) };
+}
+const LOOKS = [
+  { name: 'Original (no change)', hue: 220, sat: 35, accent: '#3b82f6' },
+  { name: 'Midnight Blue', hue: 220, sat: 35, accent: '#3b82f6' },
+  { name: 'Amber Gold', hue: 222, sat: 35, accent: '#f0a500' },
+  { name: 'Ocean', hue: 200, sat: 38, accent: '#06b6d4' },
+  { name: 'Emerald', hue: 155, sat: 34, accent: '#10b981' },
+  { name: 'Royal Purple', hue: 265, sat: 34, accent: '#8b5cf6' },
+  { name: 'Crimson', hue: 350, sat: 32, accent: '#ef4444' },
+  { name: 'Sunset', hue: 18, sat: 34, accent: '#f97316' },
+  { name: 'Graphite', hue: 215, sat: 8, accent: '#64748b' }
+];
+function openDesign(c) {
+  const v = $('designView'); v.style.display = 'block'; $('companies').style.display = 'none'; $('usersView').style.display = 'none'; v.innerHTML = '';
+  const ex = themes[appKey(c, 'hask')] || themes[appKey(c, 'agash')] || null, ui = ex && ex.ui;
+  const S = { look: ui ? ui.look : 0, hue: ui ? ui.hue : 220, sat: ui ? ui.sat : 35, accent: ui ? ui.accent : '#3b82f6', rs: ex && ex.rs != null ? ex.rs : 1, scope: 'both' };
+  const vars = () => S.look === 0 ? null : lookVars(S.hue, S.sat, S.accent);
+
+  const top = el('div'); top.className = 'row'; top.style.marginBottom = '12px';
+  const closeDesign = () => { v.style.display = 'none'; $('companies').style.display = 'block'; window.scrollTo(0, 0); };
+  const back = el('button', '', '← Back'); back.className = 'act'; back.onclick = closeDesign;
+  top.appendChild(back); const tt = el('div', 'text-align:right'); tt.appendChild(coName(c, 22)); tt.appendChild(el('div', 'font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)', 'Design')); top.appendChild(tt); v.appendChild(top);
+
+  const pvBox = el('div', 'margin-bottom:12px'); v.appendChild(pvBox);
+  function drawPreview() {
+    const x = vars() || lookVars(220, 35, '#3b82f6'), R = n => 'calc(' + n + 'px*' + S.rs + ')';
+    pvBox.innerHTML = '';
+    const m = el('div', 'background:' + x.bg + ';border:1px solid ' + x.border + ';border-radius:' + R(18) + ';padding:12px;color:#e8edf5');
+    const h = el('div', 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px');
+    h.appendChild(coName(c, 22, x.accent)); h.appendChild(el('span', 'font-size:10px;padding:3px 9px;border-radius:99px;background:' + x.accent + ';color:#fff', 'ADMIN')); m.appendChild(h);
+    const g = el('div', 'display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px');
+    [['12', 'Trucks'], ['3', 'Online'], ['2', 'Pending']].forEach(([n, l], i) => { const t = el('div', 'background:' + x.card + ';border:1px solid ' + x.border + ';border-radius:' + R(12) + ';padding:8px;text-align:center'); t.appendChild(el('div', 'font-weight:700;font-size:17px;color:' + (i === 0 ? x.accent : '#e8edf5'), n)); t.appendChild(el('div', 'font-size:10px;color:#8a9bb5', l)); g.appendChild(t); }); m.appendChild(g);
+    const lst = el('div', 'background:' + x.card + ';border:1px solid ' + x.border + ';border-radius:' + R(14) + ';padding:4px 10px;margin-bottom:10px');
+    [['DJ-1234', 'Loaded', '#22c55e'], ['DJ-5678', 'Waiting', '#f59e0b'], ['DJ-9012', 'Blocked', '#ef4444']].forEach(([pl, st, col], i) => {
+      const r = el('div', 'display:flex;justify-content:space-between;align-items:center;padding:8px 0;' + (i ? 'border-top:1px solid ' + x.border : ''));
+      r.appendChild(el('span', 'font-size:13px;font-weight:600', pl)); r.appendChild(el('span', 'font-size:10px;padding:2px 8px;border-radius:99px;background:' + col + '26;color:' + col, st)); lst.appendChild(r); }); m.appendChild(lst);
+    const bt = el('div', 'display:flex;gap:8px;margin-bottom:10px');
+    bt.appendChild(el('div', 'flex:1;text-align:center;padding:10px;font-size:13px;font-weight:600;color:#fff;background:linear-gradient(135deg,' + x.accent + ',' + x.accent2 + ');border-radius:' + R(10), '＋ Add truck'));
+    bt.appendChild(el('div', 'flex:1;text-align:center;padding:10px;font-size:13px;background:' + x.card2 + ';border:1px solid ' + x.border + ';border-radius:' + R(10), 'Export')); m.appendChild(bt);
+    const nav = el('div', 'display:flex;justify-content:space-around;background:' + x.bg2 + ';border:1px solid ' + x.border + ';border-radius:' + R(14) + ';padding:8px 4px');
+    [['🚛', 'Trucks'], ['📊', 'Stats'], ['👥', 'Team'], ['⚙️', 'More']].forEach(([i, l], k) => { const n = el('div', 'text-align:center;font-size:10px;color:' + (k === 0 ? x.accent : '#8a9bb5')); n.appendChild(el('div', 'font-size:16px', i)); n.appendChild(document.createTextNode(l)); nav.appendChild(n); }); m.appendChild(nav);
+    pvBox.appendChild(m);
+  }
+  v.appendChild(el('div', 'margin:4px 0 8px;font-weight:700', 'Color theme'));
+  const tiles = el('div', 'display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px'); v.appendChild(tiles);
+  function drawTiles() {
+    tiles.innerHTML = '';
+    LOOKS.forEach((L, i) => {
+      const x = lookVars(L.hue, L.sat, L.accent), sel = S.look === i;
+      const t = el('div', 'padding:8px;border-radius:12px;cursor:pointer;background:' + x.card + ';border:2px solid ' + (sel ? 'var(--blue)' : 'var(--line)'));
+      const sw = el('div', 'display:flex;gap:4px;margin-bottom:6px'); [x.bg, x.card2, x.accent].forEach(col => sw.appendChild(el('span', 'flex:1;height:16px;border-radius:5px;border:1px solid #ffffff22;background:' + col)));
+      t.appendChild(sw); t.appendChild(el('div', 'font-size:11px;text-align:center', L.name)); t.onclick = () => pick(i); tiles.appendChild(t);
+    });
+  }
+  const cu = el('div'); cu.className = 'card';
+  cu.appendChild(el('div', 'font-weight:700;margin-bottom:8px', 'Custom colors'));
+  const r1 = el('div', 'display:flex;align-items:center;gap:10px;margin-bottom:10px'); r1.appendChild(el('span', 'flex:1;font-size:13px', 'Main color (buttons, highlights)'));
+  const ac = document.createElement('input'); ac.type = 'color'; ac.value = S.accent; ac.style.cssText = 'width:64px;height:40px;padding:2px;flex:none'; r1.appendChild(ac); cu.appendChild(r1);
+  cu.appendChild(el('div', 'font-size:13px;margin-bottom:4px', 'Background tint'));
+  const hue = document.createElement('input'); hue.type = 'range'; hue.min = 0; hue.max = 360; hue.value = S.hue; hue.style.cssText = 'padding:0;margin-bottom:10px'; cu.appendChild(hue);
+  cu.appendChild(el('div', 'font-size:13px;margin-bottom:4px', 'Background color strength'));
+  const sat = document.createElement('input'); sat.type = 'range'; sat.min = 4; sat.max = 45; sat.value = S.sat; sat.style.cssText = 'padding:0'; cu.appendChild(sat);
+  const custom = () => { S.look = -1; S.accent = ac.value; S.hue = +hue.value; S.sat = +sat.value; drawTiles(); drawPreview(); };
+  ac.oninput = hue.oninput = sat.oninput = custom;
+  v.appendChild(cu);
+  function pick(i) { S.look = i; const L = LOOKS[i]; S.hue = L.hue; S.sat = L.sat; S.accent = L.accent; ac.value = L.accent; hue.value = L.hue; sat.value = L.sat; drawTiles(); drawPreview(); }
+
+  v.appendChild(el('div', 'margin:8px 0;font-weight:700', 'Corner style'));
+  const cr = el('div', 'display:flex;gap:8px;margin-bottom:12px'); v.appendChild(cr);
+  const crBtns = [['Sharp', 0.3], ['Default', 1], ['Round', 1.6]].map(([n, val]) => { const b = el('button', '', n); b.className = 'tab'; b.onclick = () => { S.rs = val; markCr(); drawPreview(); }; b.dataset.v = val; cr.appendChild(b); return b; });
+  const markCr = () => crBtns.forEach(b => b.classList.toggle('on', +b.dataset.v === S.rs)); markCr();
+
+  v.appendChild(el('div', 'margin:8px 0;font-weight:700', 'Apply to'));
+  const sc = el('div', 'display:flex;gap:8px;margin-bottom:12px'); v.appendChild(sc);
+  const scBtns = [['Both apps', 'both'], ['Hask only', 'hask'], ['Agash only', 'agash']].map(([n, val]) => { const b = el('button', '', n); b.className = 'tab'; b.onclick = () => { S.scope = val; markSc(); }; b.dataset.v = val; sc.appendChild(b); return b; });
+  const markSc = () => scBtns.forEach(b => b.classList.toggle('on', b.dataset.v === S.scope)); markSc();
+
+  const keysOf = () => S.scope === 'both' ? [appKey(c, 'hask'), appKey(c, 'agash')] : [appKey(c, S.scope)];
+  const where = () => S.scope === 'both' ? 'Hask + Agash' : S.scope === 'hask' ? 'Hask' : 'Agash';
+  const go = el('button', '', '✅ Apply this look to ' + c.name); go.className = 'go';
+  go.onclick = async () => {
+    const vv = vars(); const obj = (vv === null && S.rs === 1) ? null : { vars: vv, rs: S.rs, name: S.look > 0 ? LOOKS[S.look].name : S.look === -1 ? 'Custom' : 'Original', ui: { look: S.look, hue: S.hue, sat: S.sat, accent: S.accent }, at: Date.now() };
+    const payload = {}; keysOf().forEach(k => payload[k] = obj === null ? deleteField() : obj);
+    try { await setDoc(doc(db, 'appConfig', 'companyThemes'), payload, { merge: true }); closeDesign(); toast('✅ Look saved for ' + c.name + ' (' + where() + ')'); }
+    catch (e) { alert('Could not save: ' + (e.code || e.message)); }
+  };
+  v.appendChild(go);
+  const rs = el('button', 'width:100%;margin-top:8px;padding:12px;color:var(--red)', '↩ Reset ' + where() + ' to the original look'); rs.className = 'act';
+  rs.onclick = async () => { if (!confirm('Go back to the original colors for ' + c.name + ' (' + where() + ')?')) return; const payload = {}; keysOf().forEach(k => payload[k] = deleteField()); try { await setDoc(doc(db, 'appConfig', 'companyThemes'), payload, { merge: true }); closeDesign(); toast('↩ Back to the original look for ' + c.name); } catch (e) { alert('Failed: ' + (e.code || e.message)); } };
+  scBtns.forEach(b => { const o = b.onclick; b.onclick = () => { o(); go.textContent = '✅ Apply this look to ' + c.name; rs.textContent = '↩ Reset ' + where() + ' to the original look'; }; });
+  v.appendChild(rs);
+  v.appendChild(el('div', 'margin-top:10px;font-size:12px;color:var(--dim)', 'Changes backgrounds, cards, borders, buttons, highlights and corners. Status colors (green / orange / red) stay the same so they keep their meaning.'));
+  drawTiles(); drawPreview();
+}
+
+function coName(c, size, accent) {
+  const t = themes[appKey(c, 'hask')] || themes[appKey(c, 'agash')];
+  const n = el('div', 'font-size:' + (size || 28) + 'px'); n.className = 'coname';
+  n.style.setProperty('--co2', accent || (t && t.vars && t.vars.accent) || '#60a5fa'); n.textContent = c.name; return n;
+}
+function toast(text) {
+  let d = $('toast');
+  if (!d) { d = el('div'); d.id = 'toast'; d.style.cssText = 'position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:#16a34a;color:#fff;padding:12px 18px;border-radius:12px;font-size:14px;z-index:99;max-width:90%;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.4)'; document.body.appendChild(d); }
+  d.textContent = text; d.style.display = 'block'; clearTimeout(d._t); d._t = setTimeout(() => { d.style.display = 'none'; }, 3500);
+}
 async function saveCompany(editId) {
   const cur = editId ? companies.find(x => x.id === editId) : null;
   const name = (prompt('Company name:', cur ? cur.name : '') || '').trim(); if (!name) return;
@@ -217,16 +508,23 @@ async function saveCompany(editId) {
     await setDoc(cref, { list });
     const m = {}; companies.concat(list).forEach(x => m[x.id] = x); companies = Object.values(m);
     loadCounts();
-    if (!editId) await setAdminPin({ id, name, sub });
+    if (!editId) {
+      const nc = { id, name, sub };
+      if (confirm('Enable the HASK app for ' + name + '?\n(OK = yes, Cancel = no)')) await setHaskAdminPin(nc);
+      if (confirm('Enable the AGASH app for ' + name + '?\n(OK = yes, Cancel = no)')) await setAgashAdminPin(nc);
+      loadCounts();
+    }
   } catch (e) { alert('Could not save: ' + (e.code || e.message)); }
 }
 
-async function toggleSuspend(c) {
-  const now = !!(status[c.id] && status[c.id].suspended);
+const appKey = (c, app) => app === 'agash' ? c.id + '__agash' : c.id;   // Hask keeps the original key
+async function toggleSuspend(c, app) {
+  const label = c.name + ' (' + (app === 'agash' ? 'Agash app' : 'Hask app') + ')', key = appKey(c, app);
+  const now = !!(status[key] && status[key].suspended);
   let message = '';
-  if (!now) { message = prompt('Message workers will see (optional):', '') || ''; if (!confirm('Suspend ' + c.name + '? Everyone in this company will be locked out.')) return; }
-  else if (!confirm('Resume ' + c.name + '?')) return;
-  try { await setDoc(doc(db, 'appConfig', 'companyStatus'), { [c.id]: { suspended: !now, message, at: Date.now() } }, { merge: true }); } catch (e) { alert('Failed: ' + (e.code || e.message)); }
+  if (!now) { message = prompt('Message workers will see (optional):', '') || ''; if (!confirm('Suspend ' + label + '? Everyone using this app in this company will be locked out. The other app is NOT affected.')) return; }
+  else if (!confirm('Resume ' + label + '?')) return;
+  try { await setDoc(doc(db, 'appConfig', 'companyStatus'), { [key]: { suspended: !now, message, at: Date.now() } }, { merge: true }); } catch (e) { alert('Failed: ' + (e.code || e.message)); }
 }
 
 function render() {
@@ -235,25 +533,47 @@ function render() {
   const box = $('companies'); box.innerHTML = '';
   const addB = el('button', 'width:100%;margin-bottom:12px;padding:12px', '＋ Add company'); addB.className = 'act'; addB.onclick = () => saveCompany(null); box.appendChild(addB);
   companies.forEach(c => {
-    const sus = !!(status[c.id] && status[c.id].suspended);
-    const on = presence.filter(p => p.company === c.id && isOn(p)).length;
-    const errs = errors.filter(e => e.company === c.id && e.ts > day).length;
+    const isAgP = p => String(p.role || '').startsWith('Agash'), isAgE = e => String(e.src || '').startsWith('Agash');
+    const onH = presence.filter(p => p.company === c.id && isOn(p) && !isAgP(p)).length;
+    const onA = presence.filter(p => p.company === c.id && isOn(p) && isAgP(p)).length;
+    const errsH = errors.filter(e => e.company === c.id && e.ts > day && !isAgE(e)).length;
+    const errsA = errors.filter(e => e.company === c.id && e.ts > day && isAgE(e)).length;
     const k = counts[c.id] || {};
     const card = el('div'); card.className = 'card';
     const top = el('div'); top.className = 'row';
-    const left = el('div'); left.appendChild(el('div', 'font-weight:700;font-size:16px', c.name)); const sub = el('div', '', c.sub || c.id); sub.className = 'dim'; left.appendChild(sub);
-    const bd = el('span', 'background:' + (sus ? 'var(--red)' : 'var(--green)') + ';color:#fff', sus ? 'SUSPENDED' : 'ACTIVE'); bd.className = 'badge';
-    top.appendChild(left); top.appendChild(bd); card.appendChild(top);
-    const st = el('div'); st.className = 'stats';
-    [['Online', on], ['Trucks', k.trucks ?? '…'], ['Workers', k.workers ?? '…'], ['Errors 24h', errs]].forEach(([l, v]) => {
-      const x = el('div'); x.appendChild(el('b', l === 'Errors 24h' && v > 0 ? 'color:var(--amber)' : '', String(v))); const d = el('span', '', l); d.className = 'dim'; x.appendChild(d); st.appendChild(x);
-    });
-    card.appendChild(st);
-    const btns = el('div', 'display:flex;gap:8px;margin-top:12px');
-    const b = el('button', 'flex:1;' + (sus ? '' : 'color:var(--red)'), sus ? '▶ Resume' : '⏸ Suspend'); b.className = 'act'; b.onclick = () => toggleSuspend(c);
+    const left = el('div'); left.appendChild(coName(c, 28)); const sub = el('div', '', c.sub || c.id); sub.className = 'cosub'; left.appendChild(sub);
+    top.appendChild(left); card.appendChild(top);
+
+    const appBlock = (title, app, isSet, stats, cols, setupLabel, setupFn) => {
+      const key = appKey(c, app), sus = !!(status[key] && status[key].suspended);
+      const head = el('div'); head.className = 'row'; head.style.marginTop = '14px'; head.style.paddingTop = '12px'; head.style.borderTop = '1px solid var(--line)';
+      head.appendChild(el('div', 'font-weight:700', title + (themes[key] ? ' 🎨' : '')));
+      const bd = isSet === undefined ? ['…', 'var(--dim)'] : !isSet ? ['NOT SET UP', 'var(--dim)'] : sus ? ['SUSPENDED', 'var(--red)'] : ['ACTIVE', 'var(--green)'];
+      const badge = el('span', 'background:' + bd[1] + ';color:#fff', bd[0]); badge.className = 'badge'; head.appendChild(badge); card.appendChild(head);
+      if (isSet) {
+        const st = el('div'); st.className = 'stats'; st.style.gridTemplateColumns = 'repeat(' + cols + ',1fr)';
+        stats.forEach(([l, v]) => { const x = el('div'); x.appendChild(el('b', l === 'Errors 24h' && v > 0 ? 'color:var(--amber)' : '', String(v))); const d = el('span', '', l); d.className = 'dim'; x.appendChild(d); st.appendChild(x); });
+        card.appendChild(st);
+      }
+      const btns = el('div', 'display:flex;gap:8px;margin-top:10px');
+      if (isSet) {
+        const sb = el('button', 'flex:1;' + (sus ? '' : 'color:var(--red)'), sus ? '▶ Resume' : '⏸ Suspend'); sb.className = 'act'; sb.onclick = () => toggleSuspend(c, app);
+        const pb = el('button', 'flex:1', '🔑 Admin PIN'); pb.className = 'act'; pb.onclick = setupFn;
+        btns.appendChild(sb); btns.appendChild(pb);
+      } else if (isSet === false) {
+        const nb = el('button', 'flex:1', setupLabel); nb.className = 'act'; nb.onclick = setupFn; btns.appendChild(nb);
+      }
+      card.appendChild(btns);
+    };
+    const haskSet = k.haskSet === undefined ? (c.id === LEGACY ? true : undefined) : k.haskSet;
+    appBlock('Hask app', 'hask', haskSet, [['Online', onH], ['Trucks', k.trucks ?? '…'], ['Workers', k.workers ?? '…'], ['Errors 24h', errsH]], 4, '＋ Set up Hask', () => setHaskAdminPin(c));
+    appBlock('Agash app', 'agash', k.agSet, [['Online', onA], ['Trucks', k.agTrucks ?? '…'], ['Errors 24h', errsA]], 3, '＋ Set up Agash', () => setAgashAdminPin(c));
+
+    const btns = el('div', 'display:flex;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)');
     const rn = el('button', 'flex:1', '✏️ Rename'); rn.className = 'act'; rn.onclick = () => saveCompany(c.id);
-    const pn = el('button', 'flex:1', '👥 Users'); pn.className = 'act'; pn.onclick = () => openUsers(c);
-    btns.appendChild(b); btns.appendChild(rn); btns.appendChild(pn); card.appendChild(btns); box.appendChild(card);
+    const pn = el('button', 'flex:1', '👥 Users & PINs'); pn.className = 'act'; pn.onclick = () => openUsers(c);
+    const dz = el('button', 'flex:1', '🎨 Design'); dz.className = 'act'; dz.onclick = () => openDesign(c);
+    btns.appendChild(rn); btns.appendChild(dz); btns.appendChild(pn); card.appendChild(btns); box.appendChild(card);
   });
   // Live
   const lv = $('live'); lv.innerHTML = '';
